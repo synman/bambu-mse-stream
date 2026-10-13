@@ -1,49 +1,71 @@
 #!/usr/bin/env python3
-"""Bambu Lab RTSPS → fragmented MP4 relay for browser MSE playback.
+"""Bambu Lab camera relay: every model, one fMP4 stream for browsers, plus JPEG snapshots.
 
-One PyAV reader demuxes the printer's H.264 over RTSPS (X1, H2D, P2S) and remuxes it
-to fragmented MP4 with no decode and no encode. Browsers play it through MediaSource.
-Nothing is transcoded, so a NAS-class host serves the camera at full rate.
+Two camera families exist and the relay picks per printer:
 
-Routes:
-  /            viewer page with an FPS meter (index.html next to this file)
-  /stream.mp4  live fMP4: init segment, then fragments from the last keyframe on
-  /stats       JSON: packets/s, kbps, GOP length, fragments/s, clients, codec, errors
+  rtsps  X1, X1C, X1E, H2D, H2S, P2S. The printer sends H.264 on RTSPS:322. Packets are
+         copied into fragmented MP4 with no decode and no encode.
+  jpeg   A1, A1 mini, P1P, P1S. The printer sends JPEG stills (about 0.5 fps) on TLS:6000.
+         Each still is encoded once with libx264 as an intra-only H.264 frame, so the same
+         fMP4 stream and the same <video> page serve it. One encode every two seconds.
 
-Configuration (environment):
-  BAMBU_HOSTNAME     printer hostname or IP (required)
-  BAMBU_ACCESS_CODE  the printer's LAN access code (required)
+Routes (``?printer=<name>`` selects a printer; the first configured one is the default):
+  /                 viewer page with an FPS meter (index.html next to this file)
+  /printers         JSON list of configured printers with their camera family
+  /stream.mp4       live fMP4: init segment, then fragments from the last keyframe on
+  /snapshot.jpg     one JPEG: the latest still (jpeg) or the latest frame decoded (rtsps)
+  /stats            JSON counters for one printer
+
+Configuration (environment), one printer:
+  BAMBU_HOSTNAME     printer hostname or IP
+  BAMBU_ACCESS_CODE  the printer's LAN access code
+  BAMBU_NAME         display name, default "printer"
+  BAMBU_CAMERA       "rtsps" or "jpeg"; default: detect (port 322 open → rtsps, else jpeg)
+or several printers:
+  BAMBU_PRINTERS     JSON list of {"name", "host", "access_code", "camera"?}
 
 Run:
-  python3 server.py [--port 8765] [--bind 127.0.0.1]
+  python3 server.py [--port 8765] [--bind 127.0.0.1] [-v]
 """
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import logging
 import os
 import queue
+import socket
+import ssl
 import struct
 import sys
 import threading
 import time
+from fractions import Fraction
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import av
 
 log = logging.getLogger("bambu-mse-stream")
 HERE = Path(__file__).resolve().parent
 
-# rtsp over TLS, the printer's self-signed certificate is not verified
+# rtsp over TLS; the printer's self-signed certificate is not verified
 AV_OPTIONS = {"rtsp_transport": "tcp", "tls_verify": "0", "allowed_media_types": "video"}
-# 200 ms fragments keep MSE latency low; frag_keyframe alone would hold a whole GOP
-MUX_OPTIONS = {"movflags": "frag_keyframe+empty_moov+default_base_moof", "frag_duration": "200000"}
+# rtsps: 200 ms fragments keep MSE latency low; frag_keyframe alone would hold a whole GOP
+MUX_RTSPS = {"movflags": "frag_keyframe+empty_moov+default_base_moof", "frag_duration": "200000"}
+# jpeg: every frame is its own fragment, flushed as soon as it is written, so a still is
+# not held back until the next one arrives two seconds later
+MUX_JPEG = {"movflags": "frag_every_frame+empty_moov+default_base_moof"}
+# intra-only, fast: one encode every ~2 s costs a few tens of ms
+X264_JPEG = {"preset": "ultrafast", "tune": "zerolatency", "crf": "22", "x264-params": "keyint=1:scenecut=0"}
 # The printer's RTP packets carry dts only (no pts), a garbage duration, and the dts
 # jumps on RTCP resync. The mp4 muxer rejects all three, so timestamps are rebuilt:
 # monotonic from 0, each step clamped to [1, 1 s] at 90 kHz.
 TB_HZ = 90000
+JPEG_NOMINAL_GAP = 2 * TB_HZ  # the A1 sends a still every 2 to 3 s
+RATE_WINDOW = 10.0  # seconds the /stats rates average over
 
 
 def _codec_string(ex: bytes) -> str:
@@ -60,6 +82,15 @@ def _codec_string(ex: bytes) -> str:
         else:
             i += 1
     return ""
+
+
+def detect_camera(host: str) -> str:
+    """rtsps when the printer answers on 322, else jpeg (the A1/P1 family has no 322)."""
+    try:
+        with socket.create_connection((host, 322), timeout=3):
+            return "rtsps"
+    except OSError:
+        return "jpeg"
 
 
 class _BoxSplitter:
@@ -87,12 +118,47 @@ class _BoxSplitter:
         pass
 
 
-class Relay:
-    """One RTSPS reader; fans fMP4 fragments out to every HTTP client."""
+def _jpeg_frames(host: str, code: str, timeout: float = 15.0):
+    """Yield JPEG stills from the A1/P1 camera on TLS:6000 until the socket fails."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.set_ciphers("DEFAULT@SECLEVEL=0")  # the printer's leaf key is short
+    except ssl.SSLError:
+        pass
+    raw = socket.create_connection((host, 6000), timeout=timeout)
+    with ctx.wrap_socket(raw, server_hostname=host) as s:
+        s.settimeout(timeout)
+        auth = struct.pack("<4I", 0x40, 0x3000, 0, 0) + b"bblp".ljust(32, b"\0") + code.encode().ljust(32, b"\0")
+        s.sendall(auth)
 
-    def __init__(self, url: str, redacted: str):
-        self._url = url
-        self._redacted = redacted
+        def read_exact(n: int) -> bytes:
+            buf = bytearray()
+            while len(buf) < n:
+                chunk = s.recv(n - len(buf))
+                if not chunk:
+                    raise ConnectionError("camera closed the socket")
+                buf += chunk
+            return bytes(buf)
+
+        while True:
+            size = struct.unpack("<I", read_exact(16)[:4])[0]
+            if not 0 < size < 8 * 1024 * 1024:
+                raise ConnectionError(f"implausible frame size {size}")
+            jpeg = read_exact(size)
+            if jpeg[:2] == b"\xff\xd8" and jpeg[-2:] == b"\xff\xd9":
+                yield jpeg
+
+
+class Relay:
+    """One printer: one camera reader, fMP4 fan-out to HTTP clients, JPEG snapshots."""
+
+    def __init__(self, name: str, host: str, code: str, camera: str | None):
+        self.name = name
+        self.host = host
+        self._code = code
+        self._camera_cfg = camera
         self._lock = threading.Lock()
         self._clients: list[queue.Queue] = []
         self._init: bytes = b""
@@ -101,14 +167,19 @@ class Relay:
         self._gop_frags: list[bytes] = []
         self._cur_key = False
         self._frag_emitted = False
+        # rtsps: raw H.264 packets since the last keyframe, decoded on demand for /snapshot.jpg
+        self._gop_pkts: list[bytes] = []
+        self._extradata: bytes = b""
+        # jpeg: the latest still, served as-is by /snapshot.jpg
+        self._last_jpeg: bytes = b""
         self.stats = {
-            "codec": "", "width": 0, "height": 0, "packets": 0, "bytes": 0, "keyframes": 0,
-            "fragments": 0, "gop_packets": 0, "clients": 0, "reconnects": 0, "started": time.time(),
-            "last_error": "",
+            "name": name, "camera": camera or "", "codec": "", "width": 0, "height": 0,
+            "packets": 0, "bytes": 0, "keyframes": 0, "fragments": 0, "gop_packets": 0,
+            "clients": 0, "reconnects": 0, "started": time.time(), "last_error": "",
         }
-        self._rate_prev = (time.time(), 0, 0, 0)
+        self._samples: list[tuple[float, int, int, int]] = []
         self._since_key = 0
-        threading.Thread(target=self._reader, daemon=True, name="rtsps-reader").start()
+        threading.Thread(target=self._reader, daemon=True, name=f"camera-{name}").start()
 
     # -- client side --------------------------------------------------------
     def subscribe(self) -> tuple[queue.Queue, bytes, list[bytes]]:
@@ -125,16 +196,39 @@ class Relay:
             self.stats["clients"] = len(self._clients)
 
     def rates(self) -> dict:
+        """Counters plus rates over the last RATE_WINDOW seconds, so a 0.5 fps camera reads
+        0.5 and not a 0/1 flicker from one-second polling."""
         now = time.time()
-        t0, p0, b0, f0 = self._rate_prev
-        dt = max(now - t0, 1e-6)
         s = self.stats
-        out = {**s, "uptime_s": round(now - s["started"], 1),
-               "packets_per_s": round((s["packets"] - p0) / dt, 1),
-               "kbps": round((s["bytes"] - b0) * 8 / dt / 1000, 1),
-               "fragments_per_s": round((s["fragments"] - f0) / dt, 1)}
-        self._rate_prev = (now, s["packets"], s["bytes"], s["fragments"])
-        return out
+        self._samples.append((now, s["packets"], s["bytes"], s["fragments"]))
+        while len(self._samples) > 1 and now - self._samples[0][0] > RATE_WINDOW:
+            self._samples.pop(0)
+        t0, p0, b0, f0 = self._samples[0]
+        dt = max(now - t0, 1.0)
+        return {**s, "uptime_s": round(now - s["started"], 1),
+                "packets_per_s": round((s["packets"] - p0) / dt, 2),
+                "kbps": round((s["bytes"] - b0) * 8 / dt / 1000, 1),
+                "fragments_per_s": round((s["fragments"] - f0) / dt, 2)}
+
+    def snapshot(self) -> bytes | None:
+        """Latest frame as JPEG. jpeg camera: the still itself. rtsps: decode the last GOP."""
+        with self._lock:
+            if self._last_jpeg:
+                return self._last_jpeg
+            pkts, extradata = list(self._gop_pkts), self._extradata
+        if not pkts:
+            return None
+        dec = av.CodecContext.create("h264", "r")
+        dec.extradata = extradata
+        frame = None
+        for data in pkts:
+            for f in dec.decode(av.Packet(data)):
+                frame = f
+        for f in dec.decode(None):
+            frame = f
+        if frame is None:
+            return None
+        return _frame_to_jpeg(frame)
 
     # -- muxer output -------------------------------------------------------
     def _on_box(self, kind: str, box: bytes) -> None:
@@ -160,30 +254,65 @@ class Relay:
                     except queue.Full:
                         pass  # slow client: drop, MSE resyncs on the next keyframe
 
+    def _mux(self, oc, os_, pkt, is_key: bool, raw: bytes | None) -> None:
+        """Account one packet, keep the snapshot GOP, mux it, track fragment keyframes."""
+        self.stats["packets"] += 1
+        self.stats["bytes"] += pkt.size
+        if is_key:
+            self.stats["keyframes"] += 1
+            if self._since_key:
+                self.stats["gop_packets"] = self._since_key
+            self._since_key = 0
+        self._since_key += 1
+        if raw is not None:
+            with self._lock:
+                if is_key:
+                    self._gop_pkts = [raw]
+                else:
+                    self._gop_pkts.append(raw)
+        self._frag_emitted = False
+        pkt.stream = os_
+        oc.mux(pkt)
+        # rtsps: the muxer flushes the previous fragment while writing the packet that
+        # opens the next one, so after a flush this packet leads the new fragment.
+        # jpeg (frag_every_frame, all intra): every fragment is keyframe-led.
+        if self._frag_emitted:
+            self._cur_key = is_key if self.stats["camera"] == "rtsps" else True
+
+    def _reset_stream(self) -> None:
+        with self._lock:
+            self._init = b""
+            self._gop_frags = []
+            self._gop_pkts = []
+
     # -- reader -------------------------------------------------------------
     def _reader(self) -> None:
         while True:
             try:
-                self._run_once()
+                camera = self._camera_cfg or detect_camera(self.host)
+                self.stats["camera"] = camera
+                if camera == "rtsps":
+                    self._run_rtsps()
+                else:
+                    self._run_jpeg()
             except Exception as e:  # noqa: BLE001
-                msg = (type(e).__name__ + ": " + str(e)[:200]).replace(self._url, self._redacted)
+                msg = (type(e).__name__ + ": " + str(e)[:200]).replace(self._code, "****")
                 self.stats["last_error"] = msg
-                log.warning("reader error: %s", msg)
+                log.warning("%s: reader error: %s", self.name, msg)
             self.stats["reconnects"] += 1
             time.sleep(2)
 
-    def _run_once(self) -> None:
-        ic = av.open(self._url, options=AV_OPTIONS, timeout=15.0)
+    def _run_rtsps(self) -> None:
+        url = f"rtsps://bblp:{self._code}@{self.host}:322/streaming/live/1"
+        ic = av.open(url, options=AV_OPTIONS, timeout=15.0)
         try:
             vs = ic.streams.video[0]
             cc = vs.codec_context
             self.stats["codec"] = _codec_string(cc.extradata or b"")
             self.stats["width"], self.stats["height"] = cc.width, cc.height
-            with self._lock:
-                self._init = b""
-                self._gop_frags = []
-            splitter = _BoxSplitter(self._on_box)
-            oc = av.open(splitter, mode="w", format="mp4", options=MUX_OPTIONS)
+            self._reset_stream()
+            self._extradata = bytes(cc.extradata or b"")
+            oc = av.open(_BoxSplitter(self._on_box), mode="w", format="mp4", options=MUX_RTSPS)
             try:
                 os_ = oc.add_stream_from_template(vs)
                 started = False
@@ -201,23 +330,10 @@ class Relay:
                         step = pkt.dts - prev_in
                         out_ts += step if 0 < step <= TB_HZ else TB_HZ // 30
                     prev_in = pkt.dts
+                    raw = bytes(pkt)
                     pkt.dts = pkt.pts = out_ts
                     pkt.duration = 0
-                    self.stats["packets"] += 1
-                    self.stats["bytes"] += pkt.size
-                    if pkt.is_keyframe:
-                        self.stats["keyframes"] += 1
-                        if self._since_key:
-                            self.stats["gop_packets"] = self._since_key
-                        self._since_key = 0
-                    self._since_key += 1
-                    self._frag_emitted = False
-                    pkt.stream = os_
-                    oc.mux(pkt)
-                    # the muxer flushes the previous fragment while writing the packet that
-                    # opens the next one, so after a flush this packet leads the new fragment
-                    if self._frag_emitted:
-                        self._cur_key = bool(pkt.is_keyframe)
+                    self._mux(oc, os_, pkt, bool(pkt.is_keyframe), raw)
             finally:
                 try:
                     oc.close()
@@ -226,22 +342,106 @@ class Relay:
         finally:
             ic.close()
 
+    def _run_jpeg(self) -> None:
+        dec = av.CodecContext.create("mjpeg", "r")
+        oc = None
+        os_ = None
+        t0 = None
+        try:
+            for jpeg in _jpeg_frames(self.host, self._code):
+                with self._lock:
+                    self._last_jpeg = jpeg
+                frames = dec.decode(av.Packet(jpeg))
+                if not frames:
+                    continue
+                frame = frames[-1].reformat(format="yuv420p")
+                if oc is None:
+                    self.stats["width"], self.stats["height"] = frame.width, frame.height
+                    self._reset_stream()
+                    oc = av.open(_BoxSplitter(self._on_box), mode="w", format="mp4", options=MUX_JPEG)
+                    os_ = oc.add_stream("libx264", rate=1)
+                    os_.width, os_.height = frame.width, frame.height
+                    os_.pix_fmt = "yuv420p"
+                    os_.time_base = Fraction(1, TB_HZ)
+                    os_.options = dict(X264_JPEG)
+                    self._cur_key = True
+                    t0 = time.monotonic()
+                ts = int((time.monotonic() - t0) * TB_HZ)
+                frame.pts = ts
+                frame.time_base = Fraction(1, TB_HZ)
+                for pkt in os_.encode(frame):
+                    # the encoder stamps packets in its own 1/1 time base; the muxer would
+                    # rescale pts and duration by 90000 and refuse the result
+                    pkt.time_base = Fraction(1, TB_HZ)
+                    pkt.pts = pkt.dts = ts
+                    pkt.duration = JPEG_NOMINAL_GAP
+                    if not self.stats["codec"]:
+                        self.stats["codec"] = _codec_string(bytes(os_.codec_context.extradata or b""))
+                    self._mux(oc, os_, pkt, True, None)
+        finally:
+            with self._lock:
+                self._last_jpeg = b""
+            if oc is not None:
+                try:
+                    oc.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+
+def _frame_to_jpeg(frame) -> bytes:
+    out = io.BytesIO()
+    oc = av.open(out, mode="w", format="mjpeg")
+    try:
+        s = oc.add_stream("mjpeg", rate=1)
+        s.width, s.height = frame.width, frame.height
+        s.pix_fmt = "yuvj420p"
+        for pkt in s.encode(frame.reformat(format="yuvj420p")):
+            oc.mux(pkt)
+        for pkt in s.encode(None):
+            oc.mux(pkt)
+    finally:
+        oc.close()
+    return out.getvalue()
+
 
 class Handler(BaseHTTPRequestHandler):
-    relay: Relay = None  # type: ignore[assignment]
+    relays: dict[str, Relay] = {}
 
     def log_message(self, fmt, *args):  # quiet
         log.debug(fmt, *args)
 
+    def _relay(self, query: dict) -> Relay | None:
+        name = (query.get("printer") or [next(iter(self.relays))])[0]
+        return self.relays.get(name)
+
     def do_GET(self):  # noqa: N802
-        path = self.path.split("?", 1)[0]
+        parts = urlsplit(self.path)
+        query = parse_qs(parts.query)
+        path = parts.path
         if path == "/":
-            body = (HERE / "index.html").read_bytes()
-            self._send(200, "text/html; charset=utf-8", body)
+            self._send(200, "text/html; charset=utf-8", (HERE / "index.html").read_bytes())
+            return
+        if path == "/printers":
+            body = [{"name": r.name, "camera": r.stats["camera"]} for r in self.relays.values()]
+            self._send(200, "application/json", json.dumps(body).encode())
+            return
+        relay = self._relay(query)
+        if relay is None:
+            self._send(404, "text/plain", b"unknown printer")
         elif path == "/stats":
-            self._send(200, "application/json", json.dumps(self.relay.rates()).encode())
+            self._send(200, "application/json", json.dumps(relay.rates()).encode())
         elif path == "/stream.mp4":
-            self._stream()
+            self._stream(relay)
+        elif path == "/snapshot.jpg":
+            try:
+                jpeg = relay.snapshot()
+            except Exception as e:  # noqa: BLE001
+                log.warning("%s: snapshot failed: %s", relay.name, e)
+                jpeg = None
+            if jpeg:
+                self._send(200, "image/jpeg", jpeg)
+            else:
+                self._send(503, "text/plain", b"no frame yet")
         else:
             self._send(404, "text/plain", b"not found")
 
@@ -253,14 +453,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _stream(self) -> None:
-        q, init, backlog = self.relay.subscribe()
+    def _stream(self, relay: Relay) -> None:
+        q, init, backlog = relay.subscribe()
         try:
             deadline = time.time() + 20
             while not init and time.time() < deadline:
                 time.sleep(0.2)
-                self.relay.unsubscribe(q)
-                q, init, backlog = self.relay.subscribe()
+                relay.unsubscribe(q)
+                q, init, backlog = relay.subscribe()
             if not init:
                 self._send(503, "text/plain", b"no stream yet")
                 return
@@ -280,7 +480,23 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, queue.Empty, OSError):
             pass
         finally:
-            self.relay.unsubscribe(q)
+            relay.unsubscribe(q)
+
+
+def load_printers() -> list[dict]:
+    raw = os.environ.get("BAMBU_PRINTERS", "").strip()
+    if raw:
+        printers = json.loads(raw)
+        for p in printers:
+            if not p.get("name") or not p.get("host") or not p.get("access_code"):
+                sys.exit("BAMBU_PRINTERS entries need name, host and access_code")
+        return printers
+    host = os.environ.get("BAMBU_HOSTNAME", "")
+    code = os.environ.get("BAMBU_ACCESS_CODE", "")
+    if not host or not code:
+        sys.exit("set BAMBU_HOSTNAME and BAMBU_ACCESS_CODE, or BAMBU_PRINTERS, in the environment")
+    return [{"name": os.environ.get("BAMBU_NAME", "printer"), "host": host, "access_code": code,
+             "camera": os.environ.get("BAMBU_CAMERA") or None}]
 
 
 def main() -> None:
@@ -291,17 +507,16 @@ def main() -> None:
     args = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.v else logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    host = os.environ.get("BAMBU_HOSTNAME", "")
-    code = os.environ.get("BAMBU_ACCESS_CODE", "")
-    if not host or not code:
-        sys.exit("set BAMBU_HOSTNAME and BAMBU_ACCESS_CODE in the environment")
-    url = f"rtsps://bblp:{code}@{host}:322/streaming/live/1"
-    redacted = f"rtsps://bblp:****@{host}:322/streaming/live/1"
+    for p in load_printers():
+        camera = p.get("camera") or None
+        if camera not in (None, "rtsps", "jpeg"):
+            sys.exit(f"printer {p['name']!r}: camera must be rtsps or jpeg")
+        Handler.relays[p["name"]] = Relay(p["name"], p["host"], p["access_code"], camera)
+        log.info("printer %s: host %s camera %s", p["name"], p["host"], camera or "detect")
 
-    Handler.relay = Relay(url, redacted)
     srv = ThreadingHTTPServer((args.bind, args.port), Handler)
     srv.daemon_threads = True
-    log.info("viewer: http://%s:%d/  source %s", "localhost" if args.bind == "127.0.0.1" else args.bind, args.port, redacted)
+    log.info("viewer: http://%s:%d/", "localhost" if args.bind == "127.0.0.1" else args.bind, args.port)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

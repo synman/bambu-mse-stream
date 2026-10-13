@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>H2D MSE test</title>
+<title>Bambu camera</title>
 <style>
   :root { color-scheme: dark; }
   body { margin: 0; background: #111; color: #ddd; font: 13px/1.4 ui-monospace, Menlo, monospace; }
@@ -16,8 +16,9 @@
   #hud table { border-collapse: collapse; } #hud td { padding: 1px 8px 1px 0; white-space: nowrap; }
   #hud td:first-child { color: #888; }
   #state { position: fixed; bottom: 12px; left: 12px; color: #888; }
-  button { position: fixed; top: 12px; right: 12px; background: #222; color: #ddd; border: 1px solid #444;
-           padding: 6px 10px; border-radius: 6px; font: inherit; }
+  #bar { position: fixed; top: 12px; right: 12px; display: flex; gap: 8px; }
+  button, select, a.btn { background: #222; color: #ddd; border: 1px solid #444; padding: 6px 10px; border-radius: 6px;
+           font: inherit; text-decoration: none; }
 </style>
 </head>
 <body>
@@ -25,6 +26,7 @@
 <div id="hud">
   <div class="big" id="fps">--<span style="font-size:14px;font-weight:400"> fps</span></div>
   <table>
+    <tr><td>source</td><td id="source">--</td></tr>
     <tr><td>decoded</td><td id="dec">--</td></tr>
     <tr><td>dropped</td><td id="drop">--</td></tr>
     <tr><td>latency</td><td id="lat">--</td></tr>
@@ -39,19 +41,27 @@
   </table>
 </div>
 <div id="state">starting</div>
-<button id="reload">reconnect</button>
+<div id="bar">
+  <select id="printer"></select>
+  <a class="btn" id="snap" href="/snapshot.jpg" target="_blank">snapshot</a>
+  <button id="reload">reconnect</button>
+</div>
 <script>
 (() => {
   const $ = (id) => document.getElementById(id)
   const video = $('v')
   const MS = window.ManagedMediaSource || window.MediaSource
   $('api').textContent = window.ManagedMediaSource ? 'ManagedMediaSource' : (window.MediaSource ? 'MediaSource' : 'none')
-  const TARGET_LATENCY = 0.5     // seconds of buffer we aim to keep ahead of playback
-  const MAX_LATENCY = 1.5        // past this we jump forward
-  let ctrl = null, ms = null, sb = null, pending = [], rxBytes = 0, rxWindow = []
+  // live-edge control per camera family: a 30 fps stream can sit 0.5 s behind the edge, a
+  // 0.5 fps still stream holds each frame for 2 to 3 s, so its "latency" is one frame
+  const EDGE = { rtsps: { target: 0.5, max: 1.5 }, jpeg: { target: 2.5, max: 8 } }
+  let printer = new URLSearchParams(location.search).get('printer') || ''
+  let camera = 'rtsps', serverRate = 0
+  let ctrl = null, ms = null, sb = null, pending = [], rxWindow = []
   let framesWindow = [], lastQuality = null, stopped = false
 
   const setState = (s) => { $('state').textContent = s }
+  const q = (path) => path + (printer ? (path.includes('?') ? '&' : '?') + 'printer=' + encodeURIComponent(printer) : '')
 
   // -------- FPS meter: presented frames per second (rVFC), fallback to playback quality
   if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
@@ -60,18 +70,20 @@
   }
   setInterval(() => {
     const now = performance.now()
-    framesWindow = framesWindow.filter(t => now - t <= 2000)
+    const win = camera === 'jpeg' ? 10000 : 2000   // a still stream needs a longer window
+    framesWindow = framesWindow.filter(t => now - t <= win)
     let fps
     if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
-      fps = framesWindow.length / 2
+      fps = framesWindow.length / (win / 1000)
     } else if (video.getVideoPlaybackQuality) {
       const q = video.getVideoPlaybackQuality()
       fps = lastQuality ? (q.totalVideoFrames - lastQuality.totalVideoFrames) : 0
       lastQuality = q
     } else fps = 0
     const el = $('fps')
-    el.firstChild.textContent = fps.toFixed(1)
-    el.className = 'big ' + (fps >= 15 ? 'ok' : fps >= 5 ? 'warn' : 'bad')
+    el.firstChild.textContent = fps.toFixed(camera === 'jpeg' ? 2 : 1)
+    const ref = serverRate || (camera === 'jpeg' ? 0.5 : 30)
+    el.className = 'big ' + (fps >= 0.8 * ref ? 'ok' : fps >= 0.4 * ref ? 'warn' : 'bad')
     if (video.getVideoPlaybackQuality) {
       const q = video.getVideoPlaybackQuality()
       $('dec').textContent = q.totalVideoFrames
@@ -84,8 +96,9 @@
     $('rx').textContent = (bytes * 8 / 2 / 1000).toFixed(0) + ' kbps'
     $('size').textContent = video.videoWidth ? video.videoWidth + 'x' + video.videoHeight : '--'
     // keep playback near the live edge
-    if (lat != null && lat > MAX_LATENCY && video.buffered.length) {
-      video.currentTime = video.buffered.end(video.buffered.length - 1) - TARGET_LATENCY
+    const edge = EDGE[camera] || EDGE.rtsps
+    if (lat != null && lat > edge.max && video.buffered.length) {
+      video.currentTime = video.buffered.end(video.buffered.length - 1) - edge.target
     }
     if (video.paused && !video.ended) video.play().catch(() => {})
   }, 1000)
@@ -99,11 +112,14 @@
   // -------- server stats
   setInterval(async () => {
     try {
-      const s = await (await fetch('/stats', { cache: 'no-store' })).json()
+      const s = await (await fetch(q('/stats'), { cache: 'no-store' })).json()
+      camera = s.camera || camera
+      serverRate = s.packets_per_s
+      $('source').textContent = s.camera === 'jpeg' ? 'jpeg stills → h264' : (s.camera === 'rtsps' ? 'rtsps h264 passthrough' : '--')
       $('srvin').textContent = s.packets_per_s + ' pkt/s · ' + s.kbps + ' kbps'
       $('gop').textContent = s.gop_packets + ' frames'
       $('frags').textContent = s.fragments_per_s + '/s'
-      $('clients').textContent = s.clients + (s.reconnects > 1 ? ' · rtsps reconnects ' + (s.reconnects - 1) : '')
+      $('clients').textContent = s.clients + (s.reconnects > 1 ? ' · reconnects ' + (s.reconnects - 1) : '')
       if (s.last_error) setState('server: ' + s.last_error)
     } catch { /* ignore */ }
   }, 1000)
@@ -125,7 +141,8 @@
 
   async function start() {
     stopped = false
-    const stats = await (await fetch('/stats', { cache: 'no-store' })).json()
+    const stats = await (await fetch(q('/stats'), { cache: 'no-store' })).json()
+    camera = stats.camera || camera
     const codec = stats.codec || 'avc1.64C029'
     const mime = 'video/mp4; codecs="' + codec + '"'
     $('codec').textContent = codec + (MS.isTypeSupported(mime) ? '' : ' (unsupported!)')
@@ -139,14 +156,13 @@
     ctrl = new AbortController()
     setState('connecting')
     try {
-      const res = await fetch('/stream.mp4?cb=' + Date.now(), { cache: 'no-store', signal: ctrl.signal })
+      const res = await fetch(q('/stream.mp4?cb=' + Date.now()), { cache: 'no-store', signal: ctrl.signal })
       if (!res.ok || !res.body) throw new Error('http ' + res.status)
       setState('streaming')
       const reader = res.body.getReader()
       for (;;) {
         const { done, value } = await reader.read()
         if (done || stopped) break
-        rxBytes += value.length
         rxWindow.push([performance.now(), value.length])
         pending.push(value)
         appendNext()
@@ -162,16 +178,37 @@
   function stop() {
     stopped = true
     try { ctrl && ctrl.abort() } catch { /* ignore */ }
-    pending = []
+    pending = []; framesWindow = []
     try { if (ms && ms.readyState === 'open') ms.endOfStream() } catch { /* ignore */ }
     sb = null; ms = null
     video.removeAttribute('src'); video.load()
   }
   function restart() { stop(); start() }
 
+  // -------- printer picker
+  fetch('/printers', { cache: 'no-store' }).then(r => r.json()).then(list => {
+    const sel = $('printer')
+    for (const p of list) {
+      const o = document.createElement('option')
+      o.value = p.name; o.textContent = p.name + (p.camera ? ' · ' + p.camera : '')
+      sel.appendChild(o)
+    }
+    if (!printer && list.length) printer = list[0].name
+    sel.value = printer
+    sel.style.display = list.length > 1 ? '' : 'none'
+    $('snap').href = q('/snapshot.jpg')
+    sel.onchange = () => {
+      printer = sel.value
+      history.replaceState(null, '', q('/'))
+      $('snap').href = q('/snapshot.jpg')
+      $('source').textContent = '--'; serverRate = 0
+      restart()
+    }
+    start()
+  }).catch(() => start())
+
   $('reload').onclick = restart
   video.addEventListener('error', () => { setState('video error: ' + (video.error && video.error.message)); setTimeout(restart, 1000) })
-  start()
 })()
 </script>
 </body>
