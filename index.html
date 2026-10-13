@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>H2D MSE test</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #111; color: #ddd; font: 13px/1.4 ui-monospace, Menlo, monospace; }
+  #wrap { position: relative; width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; }
+  video { max-width: 100%; max-height: 100%; background: #000; }
+  #hud { position: fixed; top: 12px; left: 12px; background: rgba(0,0,0,.8); padding: 10px 12px; border-radius: 8px;
+         min-width: 230px; border: 1px solid #333; }
+  #hud .big { font-size: 34px; font-weight: 700; line-height: 1; margin-bottom: 6px; }
+  #hud .big.ok { color: #4caf50; } #hud .big.warn { color: #ffb300; } #hud .big.bad { color: #f44336; }
+  #hud table { border-collapse: collapse; } #hud td { padding: 1px 8px 1px 0; white-space: nowrap; }
+  #hud td:first-child { color: #888; }
+  #state { position: fixed; bottom: 12px; left: 12px; color: #888; }
+  button { position: fixed; top: 12px; right: 12px; background: #222; color: #ddd; border: 1px solid #444;
+           padding: 6px 10px; border-radius: 6px; font: inherit; }
+</style>
+</head>
+<body>
+<div id="wrap"><video id="v" autoplay muted playsinline></video></div>
+<div id="hud">
+  <div class="big" id="fps">--<span style="font-size:14px;font-weight:400"> fps</span></div>
+  <table>
+    <tr><td>decoded</td><td id="dec">--</td></tr>
+    <tr><td>dropped</td><td id="drop">--</td></tr>
+    <tr><td>latency</td><td id="lat">--</td></tr>
+    <tr><td>rx</td><td id="rx">--</td></tr>
+    <tr><td>codec</td><td id="codec">--</td></tr>
+    <tr><td>size</td><td id="size">--</td></tr>
+    <tr><td>server in</td><td id="srvin">--</td></tr>
+    <tr><td>gop</td><td id="gop">--</td></tr>
+    <tr><td>frags</td><td id="frags">--</td></tr>
+    <tr><td>clients</td><td id="clients">--</td></tr>
+    <tr><td>api</td><td id="api">--</td></tr>
+  </table>
+</div>
+<div id="state">starting</div>
+<button id="reload">reconnect</button>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id)
+  const video = $('v')
+  const MS = window.ManagedMediaSource || window.MediaSource
+  $('api').textContent = window.ManagedMediaSource ? 'ManagedMediaSource' : (window.MediaSource ? 'MediaSource' : 'none')
+  const TARGET_LATENCY = 0.5     // seconds of buffer we aim to keep ahead of playback
+  const MAX_LATENCY = 1.5        // past this we jump forward
+  let ctrl = null, ms = null, sb = null, pending = [], rxBytes = 0, rxWindow = []
+  let framesWindow = [], lastQuality = null, stopped = false
+
+  const setState = (s) => { $('state').textContent = s }
+
+  // -------- FPS meter: presented frames per second (rVFC), fallback to playback quality
+  if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+    const tick = (now) => { framesWindow.push(now); video.requestVideoFrameCallback(tick) }
+    video.requestVideoFrameCallback(tick)
+  }
+  setInterval(() => {
+    const now = performance.now()
+    framesWindow = framesWindow.filter(t => now - t <= 2000)
+    let fps
+    if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+      fps = framesWindow.length / 2
+    } else if (video.getVideoPlaybackQuality) {
+      const q = video.getVideoPlaybackQuality()
+      fps = lastQuality ? (q.totalVideoFrames - lastQuality.totalVideoFrames) : 0
+      lastQuality = q
+    } else fps = 0
+    const el = $('fps')
+    el.firstChild.textContent = fps.toFixed(1)
+    el.className = 'big ' + (fps >= 15 ? 'ok' : fps >= 5 ? 'warn' : 'bad')
+    if (video.getVideoPlaybackQuality) {
+      const q = video.getVideoPlaybackQuality()
+      $('dec').textContent = q.totalVideoFrames
+      $('drop').textContent = q.droppedVideoFrames
+    }
+    const lat = bufferedAhead()
+    $('lat').textContent = lat == null ? '--' : lat.toFixed(2) + ' s'
+    rxWindow = rxWindow.filter(([t]) => now - t <= 2000)
+    const bytes = rxWindow.reduce((a, [, b]) => a + b, 0)
+    $('rx').textContent = (bytes * 8 / 2 / 1000).toFixed(0) + ' kbps'
+    $('size').textContent = video.videoWidth ? video.videoWidth + 'x' + video.videoHeight : '--'
+    // keep playback near the live edge
+    if (lat != null && lat > MAX_LATENCY && video.buffered.length) {
+      video.currentTime = video.buffered.end(video.buffered.length - 1) - TARGET_LATENCY
+    }
+    if (video.paused && !video.ended) video.play().catch(() => {})
+  }, 1000)
+
+  function bufferedAhead() {
+    const b = video.buffered
+    if (!b.length) return null
+    return b.end(b.length - 1) - video.currentTime
+  }
+
+  // -------- server stats
+  setInterval(async () => {
+    try {
+      const s = await (await fetch('/stats', { cache: 'no-store' })).json()
+      $('srvin').textContent = s.packets_per_s + ' pkt/s · ' + s.kbps + ' kbps'
+      $('gop').textContent = s.gop_packets + ' frames'
+      $('frags').textContent = s.fragments_per_s + '/s'
+      $('clients').textContent = s.clients + (s.reconnects > 1 ? ' · rtsps reconnects ' + (s.reconnects - 1) : '')
+      if (s.last_error) setState('server: ' + s.last_error)
+    } catch { /* ignore */ }
+  }, 1000)
+
+  // -------- MSE plumbing: fetch the live fMP4, append fragments as they arrive
+  function appendNext() {
+    if (!sb || sb.updating || !pending.length) return
+    const chunk = pending.shift()
+    try { sb.appendBuffer(chunk) } catch (e) { setState('append failed: ' + e.message); restart() }
+  }
+
+  function trimBuffer() {
+    if (!sb || sb.updating || !video.buffered.length) return
+    const start = video.buffered.start(0)
+    if (video.currentTime - start > 20) {
+      try { sb.remove(start, video.currentTime - 10) } catch { /* ignore */ }
+    }
+  }
+
+  async function start() {
+    stopped = false
+    const stats = await (await fetch('/stats', { cache: 'no-store' })).json()
+    const codec = stats.codec || 'avc1.64C029'
+    const mime = 'video/mp4; codecs="' + codec + '"'
+    $('codec').textContent = codec + (MS.isTypeSupported(mime) ? '' : ' (unsupported!)')
+    ms = new MS()
+    if (window.ManagedMediaSource) video.disableRemotePlayback = true
+    video.src = URL.createObjectURL(ms)
+    await new Promise((res) => ms.addEventListener('sourceopen', res, { once: true }))
+    sb = ms.addSourceBuffer(mime)
+    sb.mode = 'segments'
+    sb.addEventListener('updateend', () => { trimBuffer(); appendNext() })
+    ctrl = new AbortController()
+    setState('connecting')
+    try {
+      const res = await fetch('/stream.mp4?cb=' + Date.now(), { cache: 'no-store', signal: ctrl.signal })
+      if (!res.ok || !res.body) throw new Error('http ' + res.status)
+      setState('streaming')
+      const reader = res.body.getReader()
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done || stopped) break
+        rxBytes += value.length
+        rxWindow.push([performance.now(), value.length])
+        pending.push(value)
+        appendNext()
+      }
+      if (!stopped) throw new Error('stream ended')
+    } catch (e) {
+      if (stopped) return
+      setState('reconnecting: ' + e.message)
+      setTimeout(restart, 1000)
+    }
+  }
+
+  function stop() {
+    stopped = true
+    try { ctrl && ctrl.abort() } catch { /* ignore */ }
+    pending = []
+    try { if (ms && ms.readyState === 'open') ms.endOfStream() } catch { /* ignore */ }
+    sb = null; ms = null
+    video.removeAttribute('src'); video.load()
+  }
+  function restart() { stop(); start() }
+
+  $('reload').onclick = restart
+  video.addEventListener('error', () => { setState('video error: ' + (video.error && video.error.message)); setTimeout(restart, 1000) })
+  start()
+})()
+</script>
+</body>
+</html>
