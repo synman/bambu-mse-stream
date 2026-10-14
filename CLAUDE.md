@@ -19,7 +19,7 @@
   `rtsps`, else `jpeg`). `rtsps`: demux H.264, rebuild timestamps, remux to fMP4
   (`frag_keyframe` + 200 ms `frag_duration`), keep the raw GOP for on-demand snapshot
   decode. `jpeg`: TLS:6000 login, decode each still, libx264 intra encode, mux with
-  `frag_every_frame`, keep the still for snapshots. Both split the muxer output into MP4
+  one closed-at-once container per still, keep the still for snapshots. Both split the muxer output into MP4
   boxes and fan `moof`+`mdat` fragments to HTTP clients; new clients get the init segment
   plus the fragments since the last keyframe. `/stats` rates average over 10 s.
 - `index.html`: printer picker from `/printers`, MediaSource player with per-family

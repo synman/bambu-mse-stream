@@ -107,12 +107,19 @@ Per printer, one reader thread. For `rtsps` it opens
 rebuilds their timestamps (the printer sends dts only, with a bad duration, and jumps on
 RTCP resync), and muxes them into an MP4 with `empty_moov`, `frag_keyframe` and 200 ms
 `frag_duration`. For `jpeg` it logs in on TLS:6000, reads each still, decodes it, encodes it
-once with libx264 (`ultrafast`, intra-only) and muxes with `frag_every_frame`, so a still is
-sent the moment it arrives. In both cases the muxer output is cut into boxes: `ftyp`+`moov`
-become the init segment, each `moof`+`mdat` pair a fragment. Every HTTP client gets the init
-segment, the fragments since the last keyframe, then live fragments. `index.html` fetches
-`/stream.mp4`, appends chunks to a `SourceBuffer`, trims old buffer, and when the buffer runs
-too far ahead (1.5 s for `rtsps`, 8 s for `jpeg`) seeks back near the live edge.
+once with libx264 (`ultrafast`, intra-only) and muxes it through a one-packet container
+that is closed at once, so the still leaves the moment it is encoded (the mp4 muxer only
+flushes a fragment when the next packet arrives, which would hold each still for the two to
+three seconds until the following one); the fragment's `tfdt` and sequence number are then
+stamped with the still's real timestamp. In both cases the muxer output is cut into boxes:
+`ftyp`+`moov` become the init segment, each `moof`+`mdat` pair a fragment. Every HTTP client
+gets the init segment, the fragments since the last keyframe, then live fragments; when the
+printer session ends, every client's response is closed, so the browser reconnects and
+takes the new session's init segment instead of parking on the old timeline. `index.html`
+fetches `stream.mp4` (relative, so it works behind a proxy prefix such as `/webcam/`),
+appends chunks to a `SourceBuffer`, trims old buffer, seeks back near the live edge when it
+runs more than 1.5 s (`rtsps`) or 8 s (`jpeg`) ahead, and reconnects on its own when no
+bytes arrive for 10 s (`rtsps`) or 20 s (`jpeg`).
 
 ## Contributing
 

@@ -43,7 +43,7 @@
 <div id="state">starting</div>
 <div id="bar">
   <select id="printer"></select>
-  <a class="btn" id="snap" href="/snapshot.jpg" target="_blank">snapshot</a>
+  <a class="btn" id="snap" href="snapshot.jpg" target="_blank">snapshot</a>
   <button id="reload">reconnect</button>
 </div>
 <script>
@@ -63,8 +63,14 @@
   // the next start() has already cleared `stopped`; without this check the old connection's
   // catch scheduled another restart, and the stream restarted every second (seen 2026-10-13).
   let generation = 0
+  // Bytes stopped arriving while the connection stayed open: a silent stall. The relay
+  // reconnects on hard errors and closes clients when it does, but a TCP path that merely
+  // goes quiet looks like a live stream, so the page reconnects itself past these limits.
+  const STALL_MS = { rtsps: 10000, jpeg: 20000 }
+  let lastByteAt = 0
 
   const setState = (s) => { $('state').textContent = s }
+  // Routes are relative, so the page works at / and behind a proxy prefix such as /webcam/
   const q = (path) => path + (printer ? (path.includes('?') ? '&' : '?') + 'printer=' + encodeURIComponent(printer) : '')
 
   // -------- FPS meter: presented frames per second (rVFC), fallback to playback quality
@@ -105,6 +111,11 @@
       video.currentTime = video.buffered.end(video.buffered.length - 1) - edge.target
     }
     if (video.paused && !video.ended) video.play().catch(() => {})
+    if (lastByteAt && now - lastByteAt > (STALL_MS[camera] || STALL_MS.rtsps)) {
+      lastByteAt = 0
+      setState('stalled, reconnecting')
+      restart()
+    }
   }, 1000)
 
   function bufferedAhead() {
@@ -116,7 +127,7 @@
   // -------- server stats
   setInterval(async () => {
     try {
-      const s = await (await fetch(q('/stats'), { cache: 'no-store' })).json()
+      const s = await (await fetch(q('stats'), { cache: 'no-store' })).json()
       camera = s.camera || camera
       serverRate = s.packets_per_s
       $('source').textContent = s.camera === 'jpeg' ? 'jpeg stills → h264' : (s.camera === 'rtsps' ? 'rtsps h264 passthrough' : '--')
@@ -146,16 +157,32 @@
   async function start() {
     const gen = ++generation
     stopped = false
-    const stats = await (await fetch(q('/stats'), { cache: 'no-store' })).json()
+    lastByteAt = 0
+    let stats = {}
+    try {
+      stats = await (await fetch(q('stats'), { cache: 'no-store' })).json()
+    } catch (e) {
+      if (gen !== generation) return
+      setState('reconnecting: ' + e.message)
+      setTimeout(() => { if (gen === generation) restart() }, 2000)
+      return
+    }
     if (gen !== generation) return
     camera = stats.camera || camera
     const codec = stats.codec || 'avc1.64C029'
     const mime = 'video/mp4; codecs="' + codec + '"'
-    $('codec').textContent = codec + (MS.isTypeSupported(mime) ? '' : ' (unsupported!)')
+    if (!MS || !MS.isTypeSupported(mime)) {
+      $('codec').textContent = codec + ' (unsupported!)'
+      setState(MS ? 'this browser cannot play ' + codec : 'this browser has no MediaSource')
+      return
+    }
+    $('codec').textContent = codec
     ms = new MS()
     if (window.ManagedMediaSource) video.disableRemotePlayback = true
-    video.src = URL.createObjectURL(ms)
+    const src = URL.createObjectURL(ms)
+    video.src = src
     await new Promise((res) => ms.addEventListener('sourceopen', res, { once: true }))
+    URL.revokeObjectURL(src)  // the element holds the MediaSource; the URL entry is not needed
     if (gen !== generation) return
     sb = ms.addSourceBuffer(mime)
     sb.mode = 'segments'
@@ -173,14 +200,16 @@
     ctrl = new AbortController()
     setState('connecting')
     try {
-      const res = await fetch(q('/stream.mp4?cb=' + Date.now()), { cache: 'no-store', signal: ctrl.signal })
+      const res = await fetch(q('stream.mp4?cb=' + Date.now()), { cache: 'no-store', signal: ctrl.signal })
       if (gen !== generation) return
       if (!res.ok || !res.body) throw new Error('http ' + res.status)
       setState('streaming')
+      lastByteAt = performance.now()
       const reader = res.body.getReader()
       for (;;) {
         const { done, value } = await reader.read()
         if (done || gen !== generation) break
+        lastByteAt = performance.now()
         rxWindow.push([performance.now(), value.length])
         pending.push(value)
         appendNext()
@@ -204,7 +233,7 @@
   function restart() { stop(); start() }
 
   // -------- printer picker
-  fetch('/printers', { cache: 'no-store' }).then(r => r.json()).then(list => {
+  fetch('printers', { cache: 'no-store' }).then(r => r.json()).then(list => {
     const sel = $('printer')
     for (const p of list) {
       const o = document.createElement('option')
@@ -214,11 +243,11 @@
     if (!printer && list.length) printer = list[0].name
     sel.value = printer
     sel.style.display = list.length > 1 ? '' : 'none'
-    $('snap').href = q('/snapshot.jpg')
+    $('snap').href = q('snapshot.jpg')
     sel.onchange = () => {
       printer = sel.value
-      history.replaceState(null, '', q('/'))
-      $('snap').href = q('/snapshot.jpg')
+      history.replaceState(null, '', q(location.pathname))
+      $('snap').href = q('snapshot.jpg')
       $('source').textContent = '--'; serverRate = 0
       restart()
     }

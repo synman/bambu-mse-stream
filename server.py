@@ -55,9 +55,14 @@ HERE = Path(__file__).resolve().parent
 AV_OPTIONS = {"rtsp_transport": "tcp", "tls_verify": "0", "allowed_media_types": "video"}
 # rtsps: 200 ms fragments keep MSE latency low; frag_keyframe alone would hold a whole GOP
 MUX_RTSPS = {"movflags": "frag_keyframe+empty_moov+default_base_moof", "frag_duration": "200000"}
-# jpeg: every frame is its own fragment, flushed as soon as it is written, so a still is
-# not held back until the next one arrives two seconds later
-MUX_JPEG = {"movflags": "frag_every_frame+empty_moov+default_base_moof"}
+# jpeg: every still is muxed through its own one-packet container, closed at once. The mp4
+# muxer only flushes a fragment when the NEXT packet arrives (frag_every_frame included), which
+# would hold each still back until the following one, two or three seconds later.
+MUX_JPEG = {"movflags": "frag_keyframe+empty_moov+default_base_moof"}
+# a late joiner gets the fragments since the last keyframe; past this many the GOP is not
+# worth replaying and the backlog is dropped until the next keyframe
+GOP_FRAGS_CAP = 300
+GOP_PKTS_CAP = 600
 # intra-only, fast: one encode every ~2 s costs a few tens of ms
 X264_JPEG = {"preset": "ultrafast", "tune": "zerolatency", "crf": "22", "x264-params": "keyint=1:scenecut=0"}
 # The printer's RTP packets carry dts only (no pts), a garbage duration, and the dts
@@ -91,6 +96,34 @@ def detect_camera(host: str) -> str:
             return "rtsps"
     except OSError:
         return "jpeg"
+
+
+def _stamp_moof(moof: bytes, ts: int, seq: int) -> bytes:
+    """Rewrite a one-packet container's moof: its tfdt reads 0 (the muxer counts from the
+    container's first packet) and its mfhd sequence reads 1. Put the still's real timestamp
+    and a running sequence in, so MSE places the fragment on the stream's timeline."""
+    out = bytearray(moof)
+    i = 8  # moof header
+    while i + 8 <= len(out):
+        size, kind = struct.unpack_from(">I4s", out, i)
+        if size < 8:
+            break
+        if kind == b"mfhd":
+            struct.pack_into(">I", out, i + 12, seq & 0xFFFFFFFF)
+        elif kind == b"traf":
+            j = i + 8
+            while j + 8 <= i + size:
+                s2, k2 = struct.unpack_from(">I4s", out, j)
+                if s2 < 8:
+                    break
+                if k2 == b"tfdt":
+                    if out[j + 8] == 1:
+                        struct.pack_into(">Q", out, j + 12, ts)
+                    else:
+                        struct.pack_into(">I", out, j + 12, ts & 0xFFFFFFFF)
+                j += s2
+        i += size
+    return bytes(out)
 
 
 class _BoxSplitter:
@@ -162,6 +195,7 @@ class Relay:
         self._lock = threading.Lock()
         self._clients: list[queue.Queue] = []
         self._init: bytes = b""
+        self._init_done = False  # ftyp+moov seen once per session; later ones are dropped
         self._pending_moof: bytes | None = None
         # fragments since the last keyframe-led fragment, so a joiner starts decodable
         self._gop_frags: list[bytes] = []
@@ -177,7 +211,8 @@ class Relay:
             "packets": 0, "bytes": 0, "keyframes": 0, "fragments": 0, "gop_packets": 0,
             "clients": 0, "reconnects": 0, "started": time.time(), "last_error": "",
         }
-        self._samples: list[tuple[float, int, int, int]] = []
+        # seeded so the very first /stats call measures since start instead of reading 0
+        self._samples: list[tuple[float, int, int, int]] = [(time.time(), 0, 0, 0)]
         self._since_key = 0
         threading.Thread(target=self._reader, daemon=True, name=f"camera-{name}").start()
 
@@ -197,13 +232,16 @@ class Relay:
 
     def rates(self) -> dict:
         """Counters plus rates over the last RATE_WINDOW seconds, so a 0.5 fps camera reads
-        0.5 and not a 0/1 flicker from one-second polling."""
+        0.5 and not a 0/1 flicker from one-second polling. The oldest sample inside the
+        window is the baseline; one older sample is kept so a single call after a long
+        pause still measures against something and does not read 0."""
         now = time.time()
         s = self.stats
-        self._samples.append((now, s["packets"], s["bytes"], s["fragments"]))
-        while len(self._samples) > 1 and now - self._samples[0][0] > RATE_WINDOW:
-            self._samples.pop(0)
-        t0, p0, b0, f0 = self._samples[0]
+        with self._lock:
+            self._samples.append((now, s["packets"], s["bytes"], s["fragments"]))
+            while len(self._samples) > 2 and now - self._samples[1][0] > RATE_WINDOW:
+                self._samples.pop(0)
+            t0, p0, b0, f0 = self._samples[0]
         dt = max(now - t0, 1.0)
         return {**s, "uptime_s": round(now - s["started"], 1),
                 "packets_per_s": round((s["packets"] - p0) / dt, 2),
@@ -233,7 +271,9 @@ class Relay:
     # -- muxer output -------------------------------------------------------
     def _on_box(self, kind: str, box: bytes) -> None:
         if kind in ("ftyp", "moov"):
-            self._init += box
+            if not self._init_done:
+                self._init += box
+                self._init_done = kind == "moov"
             return
         if kind == "moof":
             self._pending_moof = box
@@ -246,6 +286,8 @@ class Relay:
             with self._lock:
                 if self._cur_key:
                     self._gop_frags = [frag]
+                elif len(self._gop_frags) >= GOP_FRAGS_CAP:
+                    self._gop_frags = []  # a GOP this long is not replayed; joiners wait
                 else:
                     self._gop_frags.append(frag)
                 for q in self._clients:
@@ -253,6 +295,21 @@ class Relay:
                         q.put_nowait(frag)
                     except queue.Full:
                         pass  # slow client: drop, MSE resyncs on the next keyframe
+
+    def _drop_clients(self) -> None:
+        """End every client's response. The next session's timestamps restart at 0, and a
+        browser fed those on its old timeline parks for good; a closed response makes it
+        reconnect and take the new init segment instead."""
+        with self._lock:
+            for q in self._clients:
+                try:
+                    q.put_nowait(None)
+                except queue.Full:
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        pass
+                    q.put_nowait(None)
 
     def _mux(self, oc, os_, pkt, is_key: bool, raw: bytes | None) -> None:
         """Account one packet, keep the snapshot GOP, mux it, track fragment keyframes."""
@@ -268,6 +325,8 @@ class Relay:
             with self._lock:
                 if is_key:
                     self._gop_pkts = [raw]
+                elif len(self._gop_pkts) >= GOP_PKTS_CAP:
+                    self._gop_pkts = []
                 else:
                     self._gop_pkts.append(raw)
         self._frag_emitted = False
@@ -280,17 +339,26 @@ class Relay:
             self._cur_key = is_key if self.stats["camera"] == "rtsps" else True
 
     def _reset_stream(self) -> None:
+        """Forget the session's init segment and backlogs, and end every client. Called when
+        a session starts (the new one has its own timeline) and when one fails (nothing
+        stale is served while the printer is away: /stream.mp4 and /snapshot.jpg answer 503
+        until a new session is up)."""
+        self._drop_clients()
         with self._lock:
             self._init = b""
+            self._init_done = False
+            self._pending_moof = None
             self._gop_frags = []
             self._gop_pkts = []
+            self._last_jpeg = b""
 
     # -- reader -------------------------------------------------------------
     def _reader(self) -> None:
         while True:
             try:
+                # stats["camera"] is only written once a session is up, so a printer that is
+                # off (322 refused → "jpeg") does not flip an RTSPS printer's family
                 camera = self._camera_cfg or detect_camera(self.host)
-                self.stats["camera"] = camera
                 if camera == "rtsps":
                     self._run_rtsps()
                 else:
@@ -299,6 +367,7 @@ class Relay:
                 msg = (type(e).__name__ + ": " + str(e)[:200]).replace(self._code, "****")
                 self.stats["last_error"] = msg
                 log.warning("%s: reader error: %s", self.name, msg)
+            self._reset_stream()
             self.stats["reconnects"] += 1
             time.sleep(2)
 
@@ -308,6 +377,7 @@ class Relay:
         try:
             vs = ic.streams.video[0]
             cc = vs.codec_context
+            self.stats["camera"] = "rtsps"
             self.stats["codec"] = _codec_string(cc.extradata or b"")
             self.stats["width"], self.stats["height"] = cc.width, cc.height
             self._reset_stream()
@@ -344,48 +414,61 @@ class Relay:
 
     def _run_jpeg(self) -> None:
         dec = av.CodecContext.create("mjpeg", "r")
-        oc = None
-        os_ = None
+        # The encoder lives on a stream of a container that is never written to; it is the
+        # template every per-still container copies its codec parameters (SPS/PPS) from.
+        enc_host = av.open(io.BytesIO(), mode="w", format="mp4")
+        enc = None
         t0 = None
         try:
             for jpeg in _jpeg_frames(self.host, self._code):
-                with self._lock:
-                    self._last_jpeg = jpeg
                 frames = dec.decode(av.Packet(jpeg))
                 if not frames:
                     continue
                 frame = frames[-1].reformat(format="yuv420p")
-                if oc is None:
+                if enc is None:
+                    self.stats["camera"] = "jpeg"
                     self.stats["width"], self.stats["height"] = frame.width, frame.height
                     self._reset_stream()
-                    oc = av.open(_BoxSplitter(self._on_box), mode="w", format="mp4", options=MUX_JPEG)
-                    os_ = oc.add_stream("libx264", rate=1)
-                    os_.width, os_.height = frame.width, frame.height
-                    os_.pix_fmt = "yuv420p"
-                    os_.time_base = Fraction(1, TB_HZ)
-                    os_.options = dict(X264_JPEG)
-                    self._cur_key = True
+                    enc = enc_host.add_stream("libx264", rate=1)
+                    enc.width, enc.height = frame.width, frame.height
+                    enc.pix_fmt = "yuv420p"
+                    enc.time_base = Fraction(1, TB_HZ)
+                    enc.options = dict(X264_JPEG)
+                    self._cur_key = True  # every still is an intra frame
                     t0 = time.monotonic()
+                with self._lock:
+                    self._last_jpeg = jpeg
                 ts = int((time.monotonic() - t0) * TB_HZ)
                 frame.pts = ts
                 frame.time_base = Fraction(1, TB_HZ)
-                for pkt in os_.encode(frame):
+                for pkt in enc.encode(frame):
                     # the encoder stamps packets in its own 1/1 time base; the muxer would
                     # rescale pts and duration by 90000 and refuse the result
                     pkt.time_base = Fraction(1, TB_HZ)
                     pkt.pts = pkt.dts = ts
                     pkt.duration = JPEG_NOMINAL_GAP
                     if not self.stats["codec"]:
-                        self.stats["codec"] = _codec_string(bytes(os_.codec_context.extradata or b""))
-                    self._mux(oc, os_, pkt, True, None)
+                        # the encoder is open now: writing the host's header copies its
+                        # SPS/PPS into the template's parameters, which every per-still
+                        # container's moov (avcC) is built from
+                        enc_host.start_encoding()
+                        self.stats["codec"] = _codec_string(bytes(enc.codec_context.extradata or b""))
+                    # one container per still: closing it flushes the fragment now. Its
+                    # ftyp/moov repeat the first session's and _on_box drops them; its moof
+                    # is stamped with the still's timestamp and a running sequence number.
+                    seq = self.stats["packets"] + 1
+                    on_box = lambda k, b, ts=ts, seq=seq: self._on_box(k, _stamp_moof(b, ts, seq) if k == "moof" else b)  # noqa: E731
+                    oc = av.open(_BoxSplitter(on_box), mode="w", format="mp4", options=MUX_JPEG)
+                    try:
+                        os_ = oc.add_stream_from_template(enc)
+                        self._mux(oc, os_, pkt, True, None)
+                    finally:
+                        oc.close()
         finally:
-            with self._lock:
-                self._last_jpeg = b""
-            if oc is not None:
-                try:
-                    oc.close()
-                except Exception:  # noqa: BLE001
-                    pass
+            try:
+                enc_host.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _frame_to_jpeg(frame) -> bytes:
@@ -475,6 +558,8 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             while True:
                 frag = q.get(timeout=30)
+                if frag is None:
+                    break  # the session ended; the client reconnects for the new one
                 self.wfile.write(frag)
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, queue.Empty, OSError):

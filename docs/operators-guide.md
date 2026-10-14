@@ -10,7 +10,7 @@ One process. Per printer, one reader thread; plus the HTTP server and one thread
 
 | Thread | Does |
 |---|---|
-| `camera-<name>` | detects the camera family (unless configured), reads the camera, remuxes to fMP4, reconnects after 2 s on any error |
+| `camera-<name>` | detects the camera family (unless configured), reads the camera, remuxes to fMP4, reconnects after 2 s on any error. On any error or new session it forgets the init segment, backlogs and last still, and closes every client's response: the browser reconnects and takes the new session's timeline instead of parking on the old one. Until a session is up, `/stream.mp4` and `/snapshot.jpg` answer 503 and `/stats` keeps the last known `camera`, so a printer that is off never reads as the other family |
 | HTTP server | `ThreadingHTTPServer`, serves `/`, `/printers`, `/stream.mp4`, `/snapshot.jpg`, `/stats` |
 | per-client | writes the init segment, the keyframe backlog, then live fragments from a queue of 400 |
 
@@ -25,7 +25,7 @@ next keyframe.
 | Printers | X1, X1C, X1E, H2D, H2S, P2S | A1, A1 mini, P1P, P1S |
 | Source | H.264 over RTSPS, port 322 | JPEG stills over TLS, port 6000, about 0.5 fps |
 | Relay work | copy packets, rebuild timestamps | decode still, encode one intra H.264 frame (libx264 `ultrafast`, crf 22) |
-| Fragmenting | `frag_keyframe` + 200 ms `frag_duration` | `frag_every_frame`: each still leaves as soon as it is encoded |
+| Fragmenting | `frag_keyframe` + 200 ms `frag_duration` | one container per still, closed at once, so each still leaves as soon as it is encoded (the muxer alone would hold it until the next one) |
 | Snapshot | the last GOP is decoded on demand | the last still is returned as-is |
 | Codec string seen | `avc1.64C029` (High 4.1) | `avc1.42C028` (Constrained Baseline 4.0) |
 | Detection | port 322 answers | port 322 refused |
@@ -119,7 +119,8 @@ after a printer reboot. The `snapshot` link opens `/snapshot.jpg` for the curren
 | page says `video error` or `append failed` | browser console | codec unsupported (`codec` row says so) or a corrupt fragment; reconnect once, then read the server log |
 | fps green, latency climbs past the limit and jumps back | network | the page is keeping up by seeking; expected on a slow link |
 | fps red, `server in` healthy | browser | the tab is throttled or the decoder is overloaded; check `dropped` |
-| fps red, `server in` 0 | printer | the camera stopped; the reader reconnects on its own after 2 s |
+| fps red, `server in` 0 | printer | the camera stopped; the reader reconnects on its own after 2 s, and the page reconnects itself when no bytes arrive for 10 s (`rtsps`) or 20 s (`jpeg`) |
+| picture frozen, `server in` healthy, page says `streaming` | browser | a stall the page's byte watchdog has not yet hit (under 10 s / 20 s); if it lasts longer than that, read the browser console and the server log, since the watchdog should have fired |
 | `Address already in use` | host | another instance holds the port: `lsof -ti tcp:8765 \| xargs kill` |
 
 The printers accept more than one camera client at once, so this relay can run beside Bambu
